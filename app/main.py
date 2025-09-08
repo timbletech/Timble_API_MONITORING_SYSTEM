@@ -13,8 +13,8 @@ Author: Integrated Monitor Team
 Version: 1.0.0
 """
 
-from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request, HTTPException, Depends, status
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,15 +23,22 @@ from typing import List, Optional, Dict, Any
 import uvicorn
 import threading
 import os
+import logging
 from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
 import json
+import asyncio
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Import models and services
 from app.db.models import (
     APIHeartbeatConfigCreate, S3BucketConfigCreate, ManualTestConfigCreate,
-    ManualTestRequest, S3APIConfigCreate, S3BucketConfig, S3LogEntry
+    ManualTestRequest, S3APIConfigCreate, S3BucketConfig, S3LogEntry,
+    UserCreate, UserLogin, UserResponse, RoleCreate, RoleResponse, TokenResponse, User, Role
 )
 from app.db.session import engine, Base, get_db
 from app.services.heartbeat_monitor import HeartbeatMonitor
@@ -39,8 +46,10 @@ from app.services.s3_unified_monitor import UnifiedS3Monitor
 from app.services.manual_test import ManualTestService
 from app.services.email_service import EmailService
 from app.services.grafana_service import GrafanaService
+from app.services.auth_service import (
+    auth_service, get_current_user, require_permission, DEFAULT_ROLES
+)
  
-
 # Load environment variables
 load_dotenv()
 
@@ -53,8 +62,6 @@ unified_s3_monitor = UnifiedS3Monitor()
 manual_test_service = ManualTestService()
 email_service = EmailService()
 grafana_service = GrafanaService()
-
-
 
 # IST timezone utility function
 def get_ist_timezone():
@@ -77,46 +84,414 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-
-
-
 @app.on_event("startup")
 async def startup_event():
     """Initialize monitoring services on startup"""
-    import logging
-    logger = logging.getLogger(__name__)
-    
     try:
-        logger.info("🚀 Starting Integrated Monitor Dashboard...")
+        logger.info("Starting Integrated Monitor Dashboard...")
         
         # Start heartbeat monitoring in background
-        logger.info("💓 Starting heartbeat monitoring...")
+        logger.info("Starting heartbeat monitoring...")
         heartbeat_thread = threading.Thread(target=heartbeat_monitor.start_monitoring, daemon=True)
         heartbeat_thread.start()
-        logger.info(f"✅ Heartbeat monitoring started (Thread ID: {heartbeat_thread.ident})")
+        logger.info(f"Heartbeat monitoring started (Thread ID: {heartbeat_thread.ident})")
         
         # Start unified S3 monitoring in background
-        logger.info("☁️ Starting unified S3 monitoring...")
+        logger.info("Starting unified S3 monitoring...")
         s3_thread = threading.Thread(target=unified_s3_monitor.start_monitoring, daemon=True)
         s3_thread.start()
-        logger.info(f"✅ Unified S3 monitoring started (Thread ID: {s3_thread.ident})")
+        logger.info(f"Unified S3 monitoring started (Thread ID: {s3_thread.ident})")
         
-        logger.info("🎉 All monitoring services started successfully!")
+        logger.info("All monitoring services started successfully!")
         
     except Exception as e:
-        logger.error(f"❌ Error starting monitoring services: {e}")
+        logger.error(f"Error starting monitoring services: {e}")
         raise
 
+# ============================================================================
+# AUTHENTICATION APIs
+# ============================================================================
 
+@app.post("/api/auth/login", response_model=TokenResponse)
+async def login(user_credentials: UserLogin, db: Session = Depends(get_db)):
+    """User login endpoint"""
+    try:
+        # Authenticate user
+        user = auth_service.authenticate_user(db, user_credentials.username, user_credentials.password)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password"
+            )
+        
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Inactive user account"
+            )
+        
+        # Update last login
+        auth_service.update_last_login(db, user.id)
+        
+        # Get user roles
+        roles = auth_service.get_user_roles(db, user.id)
+        
+        # Create access token
+        access_token_expires = timedelta(minutes=auth_service.access_token_expire_minutes)
+        access_token = auth_service.create_access_token(
+            data={"sub": user.username}, expires_delta=access_token_expires
+        )
+        
+        # Prepare user response
+        user_response = UserResponse(
+            id=user.id,
+            username=user.username,
+            email=user.email,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            is_active=user.is_active,
+            is_verified=user.is_verified,
+            last_login=user.last_login,
+            created_at=user.created_at,
+            roles=roles
+        )
+        
+        return TokenResponse(
+            access_token=access_token,
+            token_type="bearer",
+            expires_in=auth_service.access_token_expire_minutes * 60,
+            user=user_response
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+@app.post("/api/auth/register", response_model=UserResponse)
+async def register(user_data: UserCreate, db: Session = Depends(get_db)):
+    """User registration endpoint"""
+    try:
+        user = auth_service.create_user(db, user_data)
+        
+        # Get user roles
+        roles = auth_service.get_user_roles(db, user.id)
+        
+        return UserResponse(
+            id=user.id,
+            username=user.username,
+            email=user.email,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            is_active=user.is_active,
+            is_verified=user.is_verified,
+            last_login=user.last_login,
+            created_at=user.created_at,
+            roles=roles
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Registration error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+@app.post("/api/auth/register-admin", response_model=UserResponse)
+async def register_admin(
+    user_data: UserCreate, 
+    current_user: User = Depends(require_permission("users", "write")),
+    db: Session = Depends(get_db)
+):
+    """Admin user registration endpoint (admin only)"""
+    try:
+        # Only admins can register new users
+        if not auth_service.has_role(db, current_user, "admin"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only administrators can register new users"
+            )
+        
+        user = auth_service.create_user(db, user_data)
+        
+        # Get user roles
+        roles = auth_service.get_user_roles(db, user.id)
+        
+        return UserResponse(
+            id=user.id,
+            username=user.username,
+            email=user.email,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            is_active=user.is_active,
+            is_verified=user.is_verified,
+            last_login=user.last_login,
+            created_at=user.created_at,
+            roles=roles
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin registration error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+@app.get("/api/auth/me", response_model=UserResponse)
+async def get_current_user_info(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get current user information"""
+    try:
+        roles = auth_service.get_user_roles(db, current_user.id)
+        
+        return UserResponse(
+            id=current_user.id,
+            username=current_user.username,
+            email=current_user.email,
+            first_name=current_user.first_name,
+            last_name=current_user.last_name,
+            is_active=current_user.is_active,
+            is_verified=current_user.is_verified,
+            last_login=current_user.last_login,
+            created_at=current_user.created_at,
+            roles=roles
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting user info: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+@app.post("/api/auth/init-roles")
+async def initialize_default_roles(db: Session = Depends(get_db)):
+    """Initialize default roles in the system"""
+    try:
+        created_roles = []
+        
+        for role_name, role_data in DEFAULT_ROLES.items():
+            # Check if role already exists
+            existing_role = db.query(Role).filter(Role.name == role_name).first()
+            if not existing_role:
+                role = Role(
+                    name=role_name,
+                    description=role_data["description"],
+                    permissions=role_data["permissions"]
+                )
+                db.add(role)
+                created_roles.append(role_name)
+        
+        if created_roles:
+            db.commit()
+            return {"message": f"Created roles: {', '.join(created_roles)}"}
+        else:
+            return {"message": "All default roles already exist"}
+            
+    except Exception as e:
+        logger.error(f"Error initializing roles: {e}")
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+@app.put("/api/auth/users/{username}/role")
+async def update_user_role(
+    username: str, 
+    role_name: str, 
+    current_user: User = Depends(require_permission("roles", "write")),
+    db: Session = Depends(get_db)
+):
+    """Update user's role (admin only)"""
+    try:
+        # Only admins can change user roles
+        if not auth_service.has_role(db, current_user, "admin"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only administrators can change user roles"
+            )
+        
+        success = auth_service.update_user_role(db, username, role_name)
+        if success:
+            return {"message": f"Updated role for user {username} to {role_name}"}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update user role"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating user role: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+# ============================================================================
+# ADMIN USER MANAGEMENT ENDPOINTS
+# ============================================================================
+
+@app.get("/api/admin/users")
+async def get_users(
+    current_user: User = Depends(require_permission("users", "read")),
+    db: Session = Depends(get_db)
+):
+    """Get all users (admin only)"""
+    try:
+        users = auth_service.get_all_users(db)
+        return {"success": True, "users": users}
+    except Exception as e:
+        logger.error(f"Error getting users: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+@app.post("/api/admin/users")
+async def create_user_by_admin(
+    user_data: UserCreate,
+    role_name: str = "viewer",
+    current_user: User = Depends(require_permission("users", "write")),
+    db: Session = Depends(get_db)
+):
+    """Create a new user (admin only)"""
+    try:
+        # Create user using auth service
+        user = auth_service.create_user(db, user_data)
+        
+        # If a specific role is requested and it's not the default, assign it
+        if role_name != "viewer":
+            success = auth_service.assign_role_to_user(db, user.username, role_name)
+            if not success:
+                logger.warning(f"Failed to assign role {role_name} to user {user.username}")
+        
+        # Get user roles for response
+        roles = auth_service.get_user_roles(db, user.id)
+        
+        return UserResponse(
+            id=user.id,
+            username=user.username,
+            email=user.email,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            is_active=user.is_active,
+            is_verified=user.is_verified,
+            last_login=user.last_login,
+            created_at=user.created_at,
+            roles=roles
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating user: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+@app.get("/api/admin/roles")
+async def get_roles(
+    current_user: User = Depends(require_permission("roles", "read")),
+    db: Session = Depends(get_db)
+):
+    """Get all roles (admin only)"""
+    try:
+        roles = auth_service.get_all_roles(db)
+        return {"success": True, "roles": roles}
+    except Exception as e:
+        logger.error(f"Error getting roles: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+@app.delete("/api/admin/users/{username}")
+async def delete_user(
+    username: str, 
+    current_user: User = Depends(require_permission("users", "delete")),
+    db: Session = Depends(get_db)
+):
+    """Delete a user (admin only)"""
+    try:
+        # Prevent deletion of admin user
+        if username == "admin":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot delete admin user"
+            )
+        
+        # Prevent self-deletion
+        if username == current_user.username:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot delete yourself"
+            )
+        
+        success = auth_service.delete_user(db, username)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        return {"success": True, "message": f"User {username} deleted successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting user: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+@app.put("/api/admin/users/{username}/permissions")
+async def update_user_permissions(
+    username: str,
+    permissions: dict,
+    current_user: User = Depends(require_permission("users", "write")),
+    db: Session = Depends(get_db)
+):
+    """Update user permissions (admin only)"""
+    try:
+        success = auth_service.update_user_permissions(db, username, permissions)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        return {"success": True, "message": f"Permissions updated for user {username}"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating user permissions: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
 
 # ============================================================================
 # HEARTBEAT MONITORING APIs - Complete CRUD Operations
 # ============================================================================
 
 @app.post("/api/heartbeat/add")
-async def add_heartbeat_endpoint(api_config: APIHeartbeatConfigCreate):
-    """Add a new API endpoint for heartbeat monitoring"""
+async def add_heartbeat_endpoint(
+    api_config: APIHeartbeatConfigCreate,
+    current_user: User = Depends(require_permission("api_management", "write"))
+):
+    """Add a new API endpoint for heartbeat monitoring (admin only)"""
     return await heartbeat_monitor.add_endpoint(api_config)
 
 @app.get("/api/heartbeat/endpoints")
@@ -130,13 +505,20 @@ async def get_heartbeat_endpoint(endpoint_id: int):
     return await heartbeat_monitor.get_endpoint(endpoint_id)
 
 @app.put("/api/heartbeat/update/{endpoint_id}")
-async def update_heartbeat_endpoint(endpoint_id: int, api_config: APIHeartbeatConfigCreate):
-    """Update an existing API endpoint for heartbeat monitoring"""
+async def update_heartbeat_endpoint(
+    endpoint_id: int, 
+    api_config: APIHeartbeatConfigCreate,
+    current_user: User = Depends(require_permission("api_management", "write"))
+):
+    """Update an existing API endpoint for heartbeat monitoring (admin only)"""
     return await heartbeat_monitor.update_endpoint(endpoint_id, api_config)
 
 @app.delete("/api/heartbeat/delete/{endpoint_id}")
-async def delete_heartbeat_endpoint(endpoint_id: int):
-    """Delete a heartbeat monitoring endpoint"""
+async def delete_heartbeat_endpoint(
+    endpoint_id: int,
+    current_user: User = Depends(require_permission("api_management", "delete"))
+):
+    """Delete a heartbeat monitoring endpoint (admin only)"""
     return await heartbeat_monitor.delete_endpoint(endpoint_id)
 
 @app.get("/api/heartbeat/status")
@@ -159,8 +541,11 @@ async def test_heartbeat_endpoint(endpoint_id: int):
 # ============================================================================
 
 @app.post("/api/s3/add")
-async def add_s3_bucket(api_config: S3BucketConfigCreate):
-    """Add a new S3 bucket for monitoring"""
+async def add_s3_bucket(
+    api_config: S3BucketConfigCreate,
+    current_user: User = Depends(require_permission("api_management", "write"))
+):
+    """Add a new S3 bucket for monitoring (admin only)"""
     return await unified_s3_monitor.add_bucket(api_config)
 
 @app.get("/api/s3/buckets")
@@ -179,13 +564,20 @@ async def get_s3_bucket(bucket_id: int):
     return await unified_s3_monitor.get_bucket(bucket_id)
 
 @app.put("/api/s3/update/{bucket_id}")
-async def update_s3_bucket(bucket_id: int, api_config: S3BucketConfigCreate):
-    """Update an existing S3 bucket configuration"""
+async def update_s3_bucket(
+    bucket_id: int, 
+    api_config: S3BucketConfigCreate,
+    current_user: User = Depends(require_permission("api_management", "write"))
+):
+    """Update an existing S3 bucket configuration (admin only)"""
     return await unified_s3_monitor.update_bucket(bucket_id, api_config)
 
 @app.delete("/api/s3/delete/{bucket_id}")
-async def delete_s3_bucket(bucket_id: int):
-    """Delete an S3 bucket configuration"""
+async def delete_s3_bucket(
+    bucket_id: int,
+    current_user: User = Depends(require_permission("api_management", "delete"))
+):
+    """Delete an S3 bucket configuration (admin only)"""
     return await unified_s3_monitor.delete_bucket(bucket_id)
 
 @app.get("/api/s3/status")
@@ -216,16 +608,12 @@ async def get_s3_logs(bucket_id: int, hours: int = 24):
         )
         
         # Add debug info for troubleshooting
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info(f"🔍 S3 Logs for bucket {bucket_name}: {logs_resp}")
+        logger.info(f"S3 Logs for bucket {bucket_name}: {logs_resp}")
         
         return logs_resp
 
     except Exception as e:
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.error(f"❌ Error getting S3 logs for bucket {bucket_id}: {str(e)}")
+        logger.error(f"Error getting S3 logs for bucket {bucket_id}: {str(e)}")
         return {"success": False, "error": str(e)}
 
 @app.get("/api/s3/logs/{bucket_id}/content")
@@ -476,8 +864,6 @@ async def get_realtime_s3_api_logs(api_name: Optional[str] = None, minutes: int 
 @app.get("/api/s3/api/logs/stream")
 async def stream_s3_api_logs(api_name: Optional[str] = None):
     """Stream S3 API logs in real-time using Server-Sent Events"""
-    from fastapi.responses import StreamingResponse
-    import asyncio
     
     async def log_stream():
         """Stream logs in real-time"""
@@ -595,10 +981,7 @@ async def refresh_all_data():
 async def start_s3_monitoring():
     """Manually start S3 monitoring services"""
     try:
-        import logging
-        logger = logging.getLogger(__name__)
-        
-        logger.info("🔄 Manually starting S3 monitoring services...")
+        logger.info("Manually starting S3 monitoring services...")
         
         # Start S3 monitoring in background
         s3_thread = threading.Thread(target=unified_s3_monitor.start_monitoring, daemon=True)
@@ -608,7 +991,7 @@ async def start_s3_monitoring():
         s3_api_thread = threading.Thread(target=unified_s3_monitor.start_monitoring, daemon=True)
         s3_api_thread.start()
         
-        logger.info("✅ S3 monitoring services started manually")
+        logger.info("S3 monitoring services started manually")
         
         return {
             "success": True, 
@@ -618,7 +1001,7 @@ async def start_s3_monitoring():
         }
         
     except Exception as e:
-        logger.error(f"❌ Error starting S3 monitoring: {e}")
+        logger.error(f"Error starting S3 monitoring: {e}")
         return {"success": False, "error": str(e)}
 
 @app.get("/api/s3/monitoring-status")
@@ -708,13 +1091,8 @@ async def get_stored_logs_status():
         return {"success": False, "error": str(e)}
 
 # ============================================================================
-# HEALTH CHECK
+# DEBUG AND TESTING ENDPOINTS
 # ============================================================================
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.now(get_ist_timezone())}
 
 @app.get("/api/debug/s3-logs-count")
 async def debug_s3_logs_count():
@@ -806,6 +1184,15 @@ async def create_sample_s3_logs(bucket_id: int):
             
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+# ============================================================================
+# HEALTH CHECK
+# ============================================================================
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.now(get_ist_timezone())}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,14 +1,116 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, Float, Text, JSON
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, Float, Text, JSON, ForeignKey
 from sqlalchemy.sql import func
-from pydantic import BaseModel, validator
+from sqlalchemy.orm import relationship
+from pydantic import BaseModel, validator, EmailStr
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import json
+import bcrypt
 
 from .session import Base
 
+# ============================================================================
+# AUTHENTICATION MODELS
+# ============================================================================
 
-# SQLAlchemy Models
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, nullable=False, index=True)
+    email = Column(String(100), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    first_name = Column(String(50), nullable=True)
+    last_name = Column(String(50), nullable=True)
+    is_active = Column(Boolean, default=True)
+    is_verified = Column(Boolean, default=False)
+    last_login = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    
+    # Relationships
+    user_roles = relationship("UserRole", back_populates="user")
+    
+    def set_password(self, password: str):
+        """Hash and set password"""
+        salt = bcrypt.gensalt()
+        self.password_hash = bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+    
+    def check_password(self, password: str) -> bool:
+        """Check if password matches hash"""
+        return bcrypt.checkpw(password.encode('utf-8'), self.password_hash.encode('utf-8'))
+
+class Role(Base):
+    __tablename__ = "roles"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(50), unique=True, nullable=False)
+    description = Column(String(200), nullable=True)
+    permissions = Column(JSON, default={})
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    
+    # Relationships
+    user_roles = relationship("UserRole", back_populates="role")
+
+class UserRole(Base):
+    __tablename__ = "user_roles"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    role_id = Column(Integer, ForeignKey("roles.id"), nullable=False)
+    assigned_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relationships
+    user = relationship("User", back_populates="user_roles")
+    role = relationship("Role", back_populates="user_roles")
+
+# ============================================================================
+# PYDANTIC MODELS FOR AUTHENTICATION
+# ============================================================================
+
+class UserCreate(BaseModel):
+    username: str
+    email: str
+    password: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    is_active: bool
+    is_verified: bool
+    last_login: Optional[datetime] = None
+    created_at: datetime
+    roles: List[str] = []
+
+class RoleCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    permissions: Dict[str, Any] = {}
+
+class RoleResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    permissions: Dict[str, Any] = {}
+    created_at: datetime
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+    expires_in: int
+    user: UserResponse
+
+# ============================================================================
+# EXISTING MODELS (keep all existing code below)
+# ============================================================================
+
 class APIHeartbeatConfig(Base):
     __tablename__ = "api_heartbeat_configs"
     id = Column(Integer, primary_key=True, index=True)
