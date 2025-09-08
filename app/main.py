@@ -823,12 +823,12 @@ async def get_s3_api_log_analysis(api_id: int, hours: int = 24):
 
 @app.get("/api/s3/api/logs")
 async def get_s3_api_logs(api_id: Optional[int] = None, bucket_name: Optional[str] = None, 
-                         hours: int = 24, limit: int = 100):
+                         hours: int = 24, limit: Optional[int] = None):
     """Get S3 API logs from database"""
     return await unified_s3_monitor.get_logs_from_db(api_id, bucket_name, hours, limit)
 
 @app.get("/api/s3/api/latest-logs")
-async def get_latest_s3_api_logs(hours: int = 24, limit: int = 100):
+async def get_latest_s3_api_logs(hours: int = 24, limit: Optional[int] = None):
     """Get the latest S3 API logs from bucket monitoring"""
     return await unified_s3_monitor.get_latest_api_logs(hours, limit)
 

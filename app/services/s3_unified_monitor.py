@@ -1367,7 +1367,7 @@ class UnifiedS3Monitor:
             if 'db' in locals():
                 db.close()
     
-    async def get_logs(self, api_name: str = None, hours: int = 24, limit: int = 100) -> Dict[str, Any]:
+    async def get_logs(self, api_name: str = None, hours: int = 24, limit: Optional[int] = None) -> Dict[str, Any]:
         """Get API logs"""
         try:
             db = SessionLocal()
@@ -1385,7 +1385,8 @@ class UnifiedS3Monitor:
                 since_time = datetime.now(IST_TIMEZONE) - timedelta(hours=hours)
                 query = query.filter(S3APILog.timestamp >= since_time)
             
-            logs = query.order_by(S3APILog.timestamp.desc()).limit(limit).all()
+            q = query.order_by(S3APILog.timestamp.desc())
+            logs = (q.limit(limit).all()) if isinstance(limit, int) and limit > 0 else q.all()
             
             log_data = []
             for log in logs:
@@ -1909,7 +1910,7 @@ class UnifiedS3Monitor:
                 db.close()
 
     async def get_logs_from_db(self, api_id: Optional[int] = None, bucket_name: Optional[str] = None, 
-                              hours: int = 24, limit: int = 100) -> Dict[str, Any]:
+                              hours: int = 24, limit: Optional[int] = None) -> Dict[str, Any]:
         """Get S3 API logs from database"""
         try:
             db = SessionLocal()
@@ -1926,7 +1927,8 @@ class UnifiedS3Monitor:
                 since_time = datetime.now(IST_TIMEZONE) - timedelta(hours=hours)
                 query = query.filter(S3APILog.timestamp >= since_time)
             
-            logs = query.order_by(S3APILog.timestamp.desc()).limit(limit).all()
+            q = query.order_by(S3APILog.timestamp.desc())
+            logs = (q.limit(limit).all()) if isinstance(limit, int) and limit and limit > 0 else q.all()
             
             log_data = []
             for log in logs:
@@ -1956,15 +1958,16 @@ class UnifiedS3Monitor:
             if 'db' in locals():
                 db.close()
 
-    async def get_latest_api_logs(self, hours: int = 24, limit: int = 100) -> Dict[str, Any]:
+    async def get_latest_api_logs(self, hours: int = 24, limit: Optional[int] = None) -> Dict[str, Any]:
         """Get the latest S3 API logs from bucket monitoring"""
         try:
             db = SessionLocal()
             
             since_time = datetime.now(IST_TIMEZONE) - timedelta(hours=hours)
-            logs = db.query(S3APILog).filter(
+            q = db.query(S3APILog).filter(
                 S3APILog.timestamp >= since_time
-            ).order_by(S3APILog.timestamp.desc()).limit(limit).all()
+            ).order_by(S3APILog.timestamp.desc())
+            logs = (q.limit(limit).all()) if isinstance(limit, int) and limit and limit > 0 else q.all()
             
             log_data = []
             for log in logs:
@@ -2137,24 +2140,8 @@ class UnifiedS3Monitor:
                         os.remove(file_path)
                         cleaned_files += 1
             
-            # Clean database
-            db = SessionLocal()
-            try:
-                cutoff_datetime = datetime.now(IST_TIMEZONE) - timedelta(hours=retention_hours)
-                
-                s3_deleted = db.query(S3LogEntry).filter(
-                    S3LogEntry.timestamp < cutoff_datetime
-                ).delete()
-                
-                api_deleted = db.query(S3APILog).filter(
-                    S3APILog.timestamp < cutoff_datetime
-                ).delete()
-                
-                db.commit()
-                cleaned_db = s3_deleted + api_deleted
-                
-            finally:
-                db.close()
+            # Clean database (DISABLED: preserve previous logs in DB)
+            cleaned_db = 0
             
             return {
                 "success": True, 
@@ -2279,7 +2266,7 @@ class UnifiedS3Monitor:
             logger.debug(f"Error processing stored log line: {e}")
             return 0
 
-    async def process_all_stored_logs(self, limit: int = 100) -> Dict[str, Any]:
+    async def process_all_stored_logs(self, limit: int = 1000) -> Dict[str, Any]:
         """Process all stored logs for API analysis in batch (deferred processing)"""
         try:
             db = SessionLocal()
