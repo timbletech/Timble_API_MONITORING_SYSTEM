@@ -158,9 +158,11 @@ class HeartbeatMonitor:
                     "interval_minutes": config.interval_minutes,
                     "timeout_seconds": config.timeout_seconds,
                     "is_active": config.is_active,
-                    "last_check": latest_result.timestamp if latest_result else None,
-                    "last_status": latest_result.is_success if latest_result else None,
-                    "last_response_time": latest_result.response_time_ms if latest_result else None,
+                    "created_at": config.created_at.isoformat() if config.created_at else None,
+                    "updated_at": config.updated_at.isoformat() if config.updated_at else None,
+                    "last_check": latest_result.timestamp.isoformat() if latest_result and latest_result.timestamp else None,
+                    "last_status": latest_result.is_success if latest_result else False,
+                    "last_response_time": latest_result.response_time_ms if latest_result else 0,
                     "last_status_code": latest_result.status_code if latest_result else None,
                     "last_error_message": latest_result.error_message if latest_result else None
                 }
